@@ -1,5 +1,6 @@
 package ru.vk.itmo.test.grunskiialexey;
 
+import one.nio.http.HttpProvider;
 import one.nio.http.HttpServer;
 import one.nio.http.HttpServerConfig;
 import one.nio.http.HttpSession;
@@ -9,6 +10,7 @@ import one.nio.http.Request;
 import one.nio.http.RequestMethod;
 import one.nio.http.Response;
 import one.nio.server.AcceptorConfig;
+import one.nio.util.Hash;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import ru.vk.itmo.ServiceConfig;
@@ -19,7 +21,13 @@ import ru.vk.itmo.test.grunskiialexey.dao.MemorySegmentDao;
 import java.io.IOException;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.net.http.HttpTimeoutException;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.concurrent.Executor;
 import java.util.concurrent.RejectedExecutionException;
 
@@ -29,19 +37,23 @@ public class DaoServer extends HttpServer {
 
     private final Executor executor;
     private final MemorySegmentDao dao;
+    private final ServiceConfig config;
+    private final HttpClient httpClient;
 
     public DaoServer(ServiceConfig config,
                      Executor executor,
                      MemorySegmentDao dao) throws IOException {
-        super(createServerConfig(config));
+        super(createServerConfigWithPort(config.selfPort()));
         this.executor = executor;
         this.dao = dao;
+        this.config = config;
+        this.httpClient = HttpClient.newHttpClient();
     }
 
-    private static HttpServerConfig createServerConfig(ServiceConfig config) {
+    private static HttpServerConfig createServerConfigWithPort(int port) {
         HttpServerConfig serverConfig = new HttpServerConfig();
         AcceptorConfig acceptorConfig = new AcceptorConfig();
-        acceptorConfig.port = config.selfPort();
+        acceptorConfig.port = port;
         acceptorConfig.reusePort = true;
 
         serverConfig.acceptors = new AcceptorConfig[]{acceptorConfig};
@@ -78,15 +90,37 @@ public class DaoServer extends HttpServer {
 
     @Path(ENDPOINT)
     @RequestMethod(Request.METHOD_GET)
-    public Response handleGet(@Param(value = "id") String id) {
+    public Response handleGet(Request request, @Param(value = "id") String id) {
         if (id == null || id.isBlank()) {
             return new Response(Response.BAD_REQUEST, Response.EMPTY);
         }
+
+        String executorNode = getNodeById(id);
+        if (!executorNode.equals(config.selfUrl())) {
+            return invokeRemoteWithCatchingExceptions(executorNode, request);
+        }
+
         final MemorySegment key = MemorySegment.ofArray(id.getBytes(StandardCharsets.UTF_8));
         final Entry<MemorySegment> entry = dao.get(key);
         return (entry == null || entry.value() == null)
                 ? new Response(Response.NOT_FOUND, Response.EMPTY)
                 : Response.ok(entry.value().toArray(ValueLayout.JAVA_BYTE));
+    }
+
+    private Response invokeRemoteWithCatchingExceptions(String executorNode, Request request) {
+        try {
+            return invokeRemote(executorNode, request);
+        } catch (HttpTimeoutException e) {
+            LOG.info("timeout when invoked remote node");
+            return new Response(Response.REQUEST_TIMEOUT, Response.EMPTY);
+        } catch (IOException e) {
+            LOG.info("IO exception got when called remote node");
+            return new Response(Response.REQUEST_TIMEOUT, Response.EMPTY);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            LOG.info("Thread interruped");
+            return new Response(Response.REQUEST_TIMEOUT, Response.EMPTY);
+        }
     }
 
     @Path(ENDPOINT)
@@ -95,6 +129,12 @@ public class DaoServer extends HttpServer {
         if (id == null || id.isBlank() || request.getBody() == null) {
             return new Response(Response.BAD_REQUEST, Response.EMPTY);
         }
+
+        String executorNode = getNodeById(id);
+        if (!executorNode.equals(config.selfUrl())) {
+            return invokeRemoteWithCatchingExceptions(executorNode, request);
+        }
+
         final MemorySegment key = MemorySegment.ofArray(id.getBytes(StandardCharsets.UTF_8));
         final Entry<MemorySegment> entry = new BaseEntry<>(key, MemorySegment.ofArray(request.getBody()));
         dao.upsert(entry);
@@ -103,10 +143,16 @@ public class DaoServer extends HttpServer {
 
     @Path(ENDPOINT)
     @RequestMethod(Request.METHOD_DELETE)
-    public Response handleDelete(@Param(value = "id") String id) {
+    public Response handleDelete(Request request, @Param(value = "id") String id) {
         if (id == null || id.isBlank()) {
             return new Response(Response.BAD_REQUEST, Response.EMPTY);
         }
+
+        String executorNode = getNodeById(id);
+        if (!executorNode.equals(config.selfUrl())) {
+            return invokeRemoteWithCatchingExceptions(executorNode, request);
+        }
+
         final MemorySegment key = MemorySegment.ofArray(id.getBytes(StandardCharsets.UTF_8));
         final Entry<MemorySegment> entry = new BaseEntry<>(key, null);
         dao.upsert(entry);
@@ -120,6 +166,34 @@ public class DaoServer extends HttpServer {
         } else {
             session.sendError(Response.BAD_REQUEST, "Incorrect request");
         }
+    }
+
+    private Response invokeRemote(String executorNode, Request request) throws IOException, InterruptedException {
+        HttpRequest httpRequest = HttpRequest.newBuilder(URI.create(executorNode + request.getURI()))
+                .method(
+                        request.getMethodName(),
+                        request.getBody() == null
+                                ? HttpRequest.BodyPublishers.noBody()
+                                : HttpRequest.BodyPublishers.ofByteArray(request.getBody())
+                )
+                .timeout(Duration.ofMillis(500))
+                .build();
+        HttpResponse<byte[]> httpResponse = httpClient.send(httpRequest, HttpResponse.BodyHandlers.ofByteArray());
+        return new Response(Integer.toString(httpResponse.statusCode()), httpResponse.body());
+    }
+
+    private String getNodeById(String id) {
+        int nodeId = 0;
+        int maxHash = Hash.murmur3(config.clusterUrls().getFirst() + id);
+        for (int i = 1; i < config.clusterUrls().size(); i++) {
+            String url = config.clusterUrls().get(i);
+            int result = Hash.murmur3(url + id);
+            if (maxHash < result) {
+                maxHash = result;
+                nodeId = i;
+            }
+        }
+        return config.clusterUrls().get(nodeId);
     }
 
     private interface ERunnable {

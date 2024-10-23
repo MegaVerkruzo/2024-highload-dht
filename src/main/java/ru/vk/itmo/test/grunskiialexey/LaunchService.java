@@ -1,6 +1,8 @@
 package ru.vk.itmo.test.grunskiialexey;
 
 import one.nio.async.CustomThreadFactory;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import ru.vk.itmo.Service;
 import ru.vk.itmo.ServiceConfig;
 import ru.vk.itmo.test.ServiceFactory;
@@ -9,25 +11,34 @@ import ru.vk.itmo.test.grunskiialexey.dao.MemorySegmentDao;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 import static ru.vk.itmo.test.grunskiialexey.dao.MemorySegmentDao.createDao;
 
 public class LaunchService implements Service {
+    private static final Logger LOG = LoggerFactory.getLogger(LaunchService.class);
     private static final int THREADS = Runtime.getRuntime().availableProcessors();
     private static final int QUEUE_SIZE = 1024;
+    private static final String LOCALHOST_PREFIX = "http://localhost:";
 
     private final ServiceConfig config;
     private ExecutorService executor;
 
     private MemorySegmentDao dao;
     private DaoServer server;
+    private boolean stopped;
 
     public LaunchService(ServiceConfig config) {
         this.config = config;
@@ -37,7 +48,7 @@ public class LaunchService implements Service {
     There are will be code which execute server with some actions
      */
     @Override
-    public CompletableFuture<Void> start() throws IOException {
+    public synchronized CompletableFuture<Void> start() throws IOException {
         dao = createDao(config);
         ArrayBlockingQueue<Runnable> queue = new ArrayBlockingQueue<>(QUEUE_SIZE);
         ThreadPoolExecutor executor = new ThreadPoolExecutor(THREADS, THREADS,
@@ -49,14 +60,22 @@ public class LaunchService implements Service {
         this.executor = executor;
         server = new DaoServer(config, executor, dao);
         server.start();
+        stopped = false;
         return CompletableFuture.completedFuture(null);
     }
 
     @Override
-    public CompletableFuture<Void> stop() throws IOException {
-        server.stop();
-        shutdownAndAwaitTermination(executor);
-        dao.close();
+    public synchronized CompletableFuture<Void> stop() throws IOException {
+        if (stopped) {
+            return CompletableFuture.completedFuture(null);
+        }
+        try {
+            server.stop();
+            shutdownAndAwaitTermination(executor);
+        } finally {
+            dao.close();
+        }
+        stopped = true;
         return CompletableFuture.completedFuture(null);
     }
 
@@ -75,7 +94,7 @@ public class LaunchService implements Service {
         }
     }
 
-    @ServiceFactory(stage = 2)
+    @ServiceFactory(stage = 3)
     public static class Factory implements ServiceFactory.Factory {
 
         @Override
@@ -85,19 +104,34 @@ public class LaunchService implements Service {
     }
 
     public static void main(String[] args) throws IOException {
-        java.nio.file.Path databasePath = java.nio.file.Path.of("db");
-        if (!Files.exists(databasePath)) {
-            Files.createDirectory(databasePath);
+        Map<Integer, String> nodes = new HashMap<>();
+        int nodePort = 8081;
+        for (int i = 0; i < 3; i++) {
+            nodes.put(nodePort, LOCALHOST_PREFIX + nodePort);
+            nodePort += 100;
         }
-        LaunchService server = new LaunchService(new ServiceConfig(
-                8081, "http://localhost",
-                List.of("http://localhost"),
-                databasePath
-        ));
-        try {
-            server.start().get();
-        } catch (InterruptedException | ExecutionException e) {
-            throw new RuntimeException(e);
+
+        List<String> clusterUrls = new ArrayList<>(nodes.values());
+        List<ServiceConfig> clusterConfigs = new ArrayList<>();
+        for (Map.Entry<Integer, String> entry : nodes.entrySet()) {
+            int port = entry.getKey();
+            String url = entry.getValue();
+            Path path = Paths.get("db/" + port);
+            Files.createDirectories(path);
+            ServiceConfig serviceConfig = new ServiceConfig(
+                    port, url, clusterUrls, path
+            );
+            clusterConfigs.add(serviceConfig);
+        }
+
+        for (ServiceConfig serviceConfig: clusterConfigs) {
+            LaunchService instance = new LaunchService(serviceConfig);
+            try {
+                instance.start().get(1, TimeUnit.SECONDS);
+            } catch (InterruptedException | ExecutionException | TimeoutException e) {
+                LOG.error("cluster was interrupted", e);
+                throw new RuntimeException(e);
+            }
         }
     }
 }
