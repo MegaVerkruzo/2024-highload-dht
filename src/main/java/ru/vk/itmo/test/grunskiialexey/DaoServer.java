@@ -9,9 +9,10 @@ import one.nio.http.Request;
 import one.nio.http.RequestMethod;
 import one.nio.http.Response;
 import one.nio.server.AcceptorConfig;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import ru.vk.itmo.ServiceConfig;
 import ru.vk.itmo.dao.BaseEntry;
-import ru.vk.itmo.dao.Config;
 import ru.vk.itmo.dao.Entry;
 import ru.vk.itmo.test.grunskiialexey.dao.MemorySegmentDao;
 
@@ -19,17 +20,24 @@ import java.io.IOException;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.nio.charset.StandardCharsets;
+import java.util.concurrent.Executor;
+import java.util.concurrent.RejectedExecutionException;
 
 public class DaoServer extends HttpServer {
-    private static final int FLUSH_THRESHOLD_BYTES = 65536;
+    private static final Logger LOG = LoggerFactory.getLogger(DaoServer.class);
     private static final String ENDPOINT = "/v0/entity";
-    private final ServiceConfig config;
-    private MemorySegmentDao dao;
+//    private final ServiceConfig config;
 
-    public DaoServer(ServiceConfig config) throws IOException {
+    private final Executor executor;
+    private final MemorySegmentDao dao;
+
+    public DaoServer(ServiceConfig config,
+                     Executor executor,
+                     MemorySegmentDao dao) throws IOException {
         super(createServerConfig(config));
-        this.config = config;
-        loadDao();
+//        this.config = config;
+        this.executor = executor;
+        this.dao = dao;
     }
 
     private static HttpServerConfig createServerConfig(ServiceConfig config) {
@@ -44,14 +52,36 @@ public class DaoServer extends HttpServer {
         return serverConfig;
     }
 
-    private static MemorySegmentDao createDao(ServiceConfig config) throws IOException {
-        return new MemorySegmentDao(new Config(config.workingDir(), FLUSH_THRESHOLD_BYTES));
+    @Override
+    public void handleRequest(Request request, HttpSession session) throws IOException {
+        handleAsync(session, () -> super.handleRequest(request, session));
+    }
+
+    private void handleAsync(HttpSession session, ERunnable runnable) throws IOException {
+        try {
+            executor.execute(() -> {
+                try {
+                    runnable.run();
+                } catch (Exception e) {
+                    LOG.error("Exception during handleRequest", e);
+                    try {
+                        session.sendError(Response.INTERNAL_ERROR, null);
+                    } catch (IOException ex) {
+                        LOG.error("Exception while sending close connection", ex);
+                        session.scheduleClose();
+                    }
+                }
+            });
+        } catch (RejectedExecutionException e) {
+            LOG.warn("Workers pool queue overflow", e);
+            session.sendError(Response.SERVICE_UNAVAILABLE, null);
+        }
     }
 
     @Path(ENDPOINT)
     @RequestMethod(Request.METHOD_GET)
-    public Response handleGet(@Param(value = "id", required = true) String id) {
-        if (id.isBlank()) {
+    public Response handleGet(@Param(value = "id") String id) {
+        if (id == null || id.isBlank()) {
             return new Response(Response.BAD_REQUEST, Response.EMPTY);
         }
         final MemorySegment key = MemorySegment.ofArray(id.getBytes(StandardCharsets.UTF_8));
@@ -63,8 +93,8 @@ public class DaoServer extends HttpServer {
 
     @Path(ENDPOINT)
     @RequestMethod(Request.METHOD_PUT)
-    public Response handlePut(Request request, @Param(value = "id", required = true) String id) {
-        if (id.isBlank() || request.getBody() == null) {
+    public Response handlePut(Request request, @Param(value = "id") String id) {
+        if (id == null || id.isBlank() || request.getBody() == null) {
             return new Response(Response.BAD_REQUEST, Response.EMPTY);
         }
         final MemorySegment key = MemorySegment.ofArray(id.getBytes(StandardCharsets.UTF_8));
@@ -75,8 +105,8 @@ public class DaoServer extends HttpServer {
 
     @Path(ENDPOINT)
     @RequestMethod(Request.METHOD_DELETE)
-    public Response handleDelete(@Param(value = "id", required = true) String id) {
-        if (id.isBlank()) {
+    public Response handleDelete(@Param(value = "id") String id) {
+        if (id == null || id.isBlank()) {
             return new Response(Response.BAD_REQUEST, Response.EMPTY);
         }
         final MemorySegment key = MemorySegment.ofArray(id.getBytes(StandardCharsets.UTF_8));
@@ -94,11 +124,7 @@ public class DaoServer extends HttpServer {
         }
     }
 
-    public final void loadDao() throws IOException {
-        dao = createDao(config);
-    }
-
-    public final void closeDao() throws IOException {
-        dao.close();
+    private interface ERunnable {
+        void run() throws Exception;
     }
 }
