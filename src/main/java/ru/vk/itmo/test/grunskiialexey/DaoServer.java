@@ -26,7 +26,6 @@ import java.util.concurrent.RejectedExecutionException;
 public class DaoServer extends HttpServer {
     private static final Logger LOG = LoggerFactory.getLogger(DaoServer.class);
     private static final String ENDPOINT = "/v0/entity";
-//    private final ServiceConfig config;
 
     private final Executor executor;
     private final MemorySegmentDao dao;
@@ -35,7 +34,6 @@ public class DaoServer extends HttpServer {
                      Executor executor,
                      MemorySegmentDao dao) throws IOException {
         super(createServerConfig(config));
-//        this.config = config;
         this.executor = executor;
         this.dao = dao;
     }
