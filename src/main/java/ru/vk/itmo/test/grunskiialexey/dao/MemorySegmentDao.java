@@ -1,5 +1,6 @@
 package ru.vk.itmo.test.grunskiialexey.dao;
 
+import ru.vk.itmo.ServiceConfig;
 import ru.vk.itmo.dao.Config;
 import ru.vk.itmo.dao.Dao;
 import ru.vk.itmo.dao.Entry;
@@ -32,6 +33,7 @@ public class MemorySegmentDao implements Dao<MemorySegment, Entry<MemorySegment>
     private final ExecutorService bgExecutor = Executors.newSingleThreadExecutor();
 
     private static final Comparator<MemorySegment> comparator = MemorySegmentDao::compare;
+    private static final int FLUSH_THRESHOLD_BYTES = 65536;
     private final Arena arena;
     private final Path path;
     private final long flushThresholdBytes;
@@ -39,6 +41,10 @@ public class MemorySegmentDao implements Dao<MemorySegment, Entry<MemorySegment>
     private final AtomicLong memTableSize = new AtomicLong(0);
     private final AtomicBoolean closed = new AtomicBoolean();
     private final ReadWriteLock upsertLock = new ReentrantReadWriteLock();
+
+    public static MemorySegmentDao createDao(ServiceConfig config) throws IOException {
+        return new MemorySegmentDao(new Config(config.workingDir(), FLUSH_THRESHOLD_BYTES));
+    }
 
     public MemorySegmentDao(Config config) throws IOException {
         this.flushThresholdBytes = config.flushThresholdBytes();
