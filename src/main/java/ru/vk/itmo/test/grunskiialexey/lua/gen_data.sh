@@ -5,7 +5,7 @@ do
   hist="hist_$file.txt"
   profile="profile_$7_$file.html"
   wrk -s "$1.lua" -d $2 -c $3 -t $4 -R $5 -L http://localhost:8081 > $full &
-  asprof -d $2 -f $profile -e $7 DaoServer
+  asprof -d $2 -f $profile -e $7 LaunchService
   cp $full "./full/$full"
   cp $profile "./profile/$profile"
   cat $full | tail -n +19 | head -n -7 > $hist
